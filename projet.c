@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 typedef struct {
     int id;
@@ -52,6 +53,34 @@ int num_supplier_trucks = 0;
 TruckInstance *trucks;
 int num_trucks = 0;
 int trucks_capacity = 0;
+
+// Function prototypes
+void init_items(int size);
+void init_truck_types(int size);
+void init_supplier_trucks(int size);
+void init_trucks(int size);
+void read_items(const char *filename);
+void read_truck_types(const char *filename);
+void read_supplier_trucks(const char *filename);
+int is_supplier_compatible(int truck_type_id, int supplier);
+void ensure_piles_capacity(TruckInstance *truck, int required_capacity);
+void ensure_pile_item_capacity(Pile *pile, int required_capacity);
+int can_add_to_pile(Pile *pile, Item item, TruckType truck_type);
+int try_find_space(TruckInstance *truck, int length, int width, int *x, int *y, TruckType truck_type);
+int find_space_for_pile(TruckInstance *truck, int length, int width, int *x, int *y);
+void add_to_pile(Pile *pile, Item item);
+void create_new_pile(TruckInstance *truck, Item item, int x, int y);
+int find_compatible_truck_type(Item item);
+void ensure_trucks_capacity(int required_capacity);
+void create_new_truck(Item item);
+void free_pile(Pile *pile);
+void free_truck(TruckInstance *truck);
+void cleanup();
+int compare_items_by_volume(const void *a, const void *b);
+void assign_items_to_trucks();
+int calculate_total_cost();
+void write_solution(const char *filename);
+void try_combine_piles(TruckInstance *truck);
 
 // Function to initialize or resize the items array
 void init_items(int size) {
@@ -272,9 +301,8 @@ int can_add_to_pile(Pile *pile, Item item, TruckType truck_type) {
     return 1;
 }
 
-// Function to find space for a new pile in a truck
-int find_space_for_pile(TruckInstance *truck, int length, int width, int *x, int *y) {
-    TruckType truck_type = truck_types[truck->truck_type_id];
+// Function to try to find space for a pile of given dimensions
+int try_find_space(TruckInstance *truck, int length, int width, int *x, int *y, TruckType truck_type) {
     for (int y_candidate = 0; y_candidate <= truck_type.width - width; y_candidate++) {
         for (int x_candidate = 0; x_candidate <= truck_type.length - length; x_candidate++) {
             int overlap = 0;
@@ -296,6 +324,24 @@ int find_space_for_pile(TruckInstance *truck, int length, int width, int *x, int
         }
     }
     return 0;
+}
+
+// Function to find space for a pile, considering rotation
+int find_space_for_pile(TruckInstance *truck, int length, int width, int *x, int *y) {
+    TruckType truck_type = truck_types[truck->truck_type_id];
+    int found = 0;
+
+    // Try original dimensions
+    found = try_find_space(truck, length, width, x, y, truck_type);
+    if (found) return 1;
+
+    // Try rotating the pile (swap length and width)
+    if (length != width) {
+        found = try_find_space(truck, width, length, x, y, truck_type);
+        if (found) return 1; // x and y will be set accordingly
+    }
+
+    return 0; // No space found
 }
 
 // Function to add an item to an existing pile
@@ -333,42 +379,31 @@ void create_new_pile(TruckInstance *truck, Item item, int x, int y) {
     truck->current_weight += item.weight;
 }
 
-// Function to find a compatible truck type for an item
+// Function to find a compatible truck type for an item, considering arrival time difference
 int find_compatible_truck_type(Item item) {
+    int best_truck_type = -1;
+    int min_diff = INT_MAX; // Large initial value
+
     for (int i = 0; i < num_truck_types; i++) {
         TruckType t = truck_types[i];
         // Check supplier compatibility
-        if (!is_supplier_compatible(t.id, item.supplier)) {
-            //printf("Truck type %d: incompatible supplier for item %d\n", i, item.id);
-            continue;
-        }
+        if (!is_supplier_compatible(t.id, item.supplier)) continue;
         // Check physical constraints
-        if (t.max_weight < item.weight) {
-            //printf("Truck type %d: insufficient weight capacity for item %d\n", i, item.id);
-            continue;
-        }
-        if (t.length < item.length) {
-            //printf("Truck type %d: insufficient length for item %d\n", i, item.id);
-            continue;
-        }
-        if (t.width < item.width) {
-            //printf("Truck type %d: insufficient width for item %d\n", i, item.id);
-            continue;
-        }
-        if (t.height < item.height) {
-            //printf("Truck type %d: insufficient height for item %d\n", i, item.id);
-            continue;
-        }
+        if (t.max_weight < item.weight) continue;
+        if (t.length < item.length && t.length < item.width) continue; // Check both orientations
+        if (t.width < item.width && t.width < item.length) continue;
+        if (t.height < item.height) continue;
         // Check arrival time constraint
-        if (item.earliest_arrival > t.arrival_time || item.latest_arrival < t.arrival_time) {
-            //printf("Truck type %d: arrival time %d not within item's window [%d, %d]\n",i, t.arrival_time, item.earliest_arrival, item.latest_arrival);
-            continue;
+        if (item.earliest_arrival > t.arrival_time || item.latest_arrival < t.arrival_time) continue;
+
+        // Calculate the difference between truck arrival time and item's latest arrival time
+        int diff = abs(t.arrival_time - item.latest_arrival);
+        if (diff < min_diff) {
+            min_diff = diff;
+            best_truck_type = i;
         }
-        //printf("Truck type %d is compatible with item %d\n", i, item.id);
-        return i;
     }
-    //printf("No compatible truck type found for item %d\n", item.id);
-    return -1; // No compatible truck type found
+    return best_truck_type;
 }
 
 // Function to ensure trucks array has enough capacity
@@ -464,34 +499,68 @@ void cleanup() {
     }
 }
 
-// Main function to assign items to trucks
+// Function to compare items by descending volume (for sorting)
+int compare_items_by_volume(const void *a, const void *b) {
+    Item *itemA = (Item *)a;
+    Item *itemB = (Item *)b;
+    int volumeA = itemA->length * itemA->width * itemA->height;
+    int volumeB = itemB->length * itemB->width * itemB->height;
+    return (volumeB - volumeA); // Sort in descending order
+}
+
+// Function to assign items to trucks with optimized strategies
 void assign_items_to_trucks() {
+    // Sort items by descending volume
+    qsort(items, num_items, sizeof(Item), compare_items_by_volume);
+
     for (int i = 0; i < num_items; i++) {
         Item item = items[i];
         int placed = 0;
-        /*printf("Processing item %d (supplier=%d, weight=%d, dimensions=%dx%dx%d, arrival window=[%d, %d])\n",
-               item.id, item.supplier, item.weight, item.length, item.width, item.height,
+        /*printf("Processing item %d (volume=%d, supplier=%d, weight=%d, arrival window=[%d, %d])\n",
+               item.id, item.length*item.width*item.height, item.supplier, item.weight,
                item.earliest_arrival, item.latest_arrival);*/
 
-        // Try to place in existing trucks
+        // Try to place in existing trucks (sorted by arrival time difference)
+        int *truck_indices = (int *)malloc(num_trucks * sizeof(int));
+        if (!truck_indices) {
+            perror("Memory allocation failed for truck indices");
+            exit(EXIT_FAILURE);
+        }
         for (int j = 0; j < num_trucks; j++) {
+            truck_indices[j] = j;
+        }
+
+        // Sort truck indices by arrival time difference
+        for (int j = 0; j < num_trucks; j++) {
+            for (int k = j + 1; k < num_trucks; k++) {
+                int arrivaltime_j = truck_types[trucks[truck_indices[j]].truck_type_id].arrival_time;
+                int arrivaltime_k = truck_types[trucks[truck_indices[k]].truck_type_id].arrival_time;
+                int diff_j = abs(arrivaltime_j - item.latest_arrival);
+                int diff_k = abs(arrivaltime_k - item.latest_arrival);
+                if (diff_j > diff_k) {
+                    int temp = truck_indices[j];
+                    truck_indices[j] = truck_indices[k];
+                    truck_indices[k] = temp;
+                }
+            }
+        }
+
+        // Try to place in existing trucks
+        for (int idx = 0; idx < num_trucks; idx++) {
+            int j = truck_indices[idx];
             TruckInstance *truck = &trucks[j];
             TruckType truck_type = truck_types[truck->truck_type_id];
 
-            // Check if the truck can pick up from the item's supplier
-            if (!is_supplier_compatible(truck_type.id, item.supplier)) {
-                //printf("  Truck %d: incompatible supplier\n", j);
-                continue;
-            }
-
-            // Check arrival time constraint
-            if (item.earliest_arrival > truck_type.arrival_time ||
+            // Check compatibility constraints
+            if (!is_supplier_compatible(truck_type.id, item.supplier) ||
+                item.earliest_arrival > truck_type.arrival_time ||
                 item.latest_arrival < truck_type.arrival_time) {
-                //printf("  Truck %d: incompatible arrival time (truck: %d, item: [%d, %d])\n", j, truck_type.arrival_time, item.earliest_arrival, item.latest_arrival);
+                //printf("  Truck %d: incompatible (supplier or arrival time)\n", j);
                 continue;
             }
 
-            //printf("  Truck %d: compatible supplier and arrival time (arrival=%d)\n", j, truck_type.arrival_time);
+            /*printf("  Truck %d: compatible (arrival=%d, diff=%d)\n",
+                   j, truck_type.arrival_time, abs(truck_type.arrival_time - item.latest_arrival));*/
 
             // Try to add to existing piles
             for (int p = 0; p < truck->num_piles; p++) {
@@ -514,11 +583,10 @@ void assign_items_to_trucks() {
                 placed = 1;
                 break;
             } else {
-                /*printf("  Could not create new pile in truck %d for item %d: weight=%d/%d, space=%d\n",
-                       j, item.id, truck->current_weight + item.weight, truck_type.max_weight,
-                       find_space_for_pile(truck, item.length, item.width, &x, &y));*/
+                //printf("  Could not create new pile in truck %d for item %d\n", j, item.id);
             }
         }
+        free(truck_indices);
 
         // If not placed yet, create a new truck
         if (!placed) {
@@ -536,6 +604,54 @@ void assign_items_to_trucks() {
             //printf("  Could not place item %d in any truck\n", item.id);
         }
     }
+
+    // Post-processing: try to combine piles in each truck
+    for (int j = 0; j < num_trucks; j++) {
+        try_combine_piles(&trucks[j]);
+    }
+}
+
+// Function to try combining compatible piles in a truck
+void try_combine_piles(TruckInstance *truck) {
+    TruckType truck_type = truck_types[truck->truck_type_id];
+    int changed;
+
+    do {
+        changed = 0;
+        for (int i = 0; i < truck->num_piles; i++) {
+            for (int j = i + 1; j < truck->num_piles; j++) {
+                Pile *pile1 = &truck->piles[i];
+                Pile *pile2 = &truck->piles[j];
+
+                // Check if piles can be combined
+                if (pile1->stackability_code == pile2->stackability_code &&
+                    pile1->length == pile2->length &&
+                    pile1->width == pile2->width &&
+                    pile1->height + pile2->height <= truck_type.height &&
+                    pile1->weight + pile2->weight <= truck_type.max_weight) {
+
+                    // Combine pile2 into pile1
+                    for (int k = 0; k < pile2->num_items; k++) {
+                        ensure_pile_item_capacity(pile1, pile1->num_items + 1);
+                        pile1->item_ids[pile1->num_items] = pile2->item_ids[k];
+                        pile1->num_items++;
+                    }
+                    pile1->height += pile2->height;
+                    pile1->weight += pile2->weight;
+
+                    // Remove pile2 by shifting later piles
+                    for (int l = j; l < truck->num_piles - 1; l++) {
+                        truck->piles[l] = truck->piles[l + 1];
+                    }
+                    truck->num_piles--;
+                    changed = 1;
+                    j--; // Adjust index since we removed a pile
+                    break; // Restart the loop since indices have changed
+                }
+            }
+            if (changed) break; // Restart outer loop if any changes were made
+        }
+    } while (changed);
 }
 
 // Function to calculate total cost
@@ -584,7 +700,7 @@ void write_solution(const char *filename) {
 
     // Write header
     fprintf(file, "EQUIPE Grocamion\n");
-    fprintf(file, "INSTANCE 2\n"); // Assuming instance 1 for now
+    fprintf(file, "INSTANCE 1\n"); // Assuming instance 1 for now
 
     printf("Writing solution to %s\n", filename);
     printf("Number of trucks: %d\n", num_trucks);
@@ -632,7 +748,7 @@ int main(int argc, char *argv[]) {
     printf("Total cost: %d\n", total_cost);
 
     // Write solution to file
-    write_solution("res_2.txt");
+    write_solution("res_1.txt");
 
     // Clean up dynamically allocated memory
     cleanup();
